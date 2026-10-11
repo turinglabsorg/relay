@@ -11,8 +11,9 @@ ROOT = Path(__file__).resolve().parents[1]
 def isolated():
     env = os.environ | {"QT_QPA_PLATFORM": "offscreen", "QT_QUICK_BACKEND": "software", "QT_QPA_PLATFORMTHEME": "", "QT_STYLE_OVERRIDE": ""}
     directory = Path(env["XDG_RUNTIME_DIR"]) / "keyring"
+    daemon_log = tempfile.TemporaryFile(mode="w+")
     daemon = subprocess.Popen(["gnome-keyring-daemon", "--foreground", "--unlock", "--components=secrets", f"--control-directory={directory}"],
-                              env=env, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                              env=env, stdin=subprocess.PIPE, stdout=daemon_log, stderr=daemon_log)
     daemon.stdin.write(b"disposable-test-keyring\n")
     daemon.stdin.close()
     try:
@@ -23,7 +24,8 @@ def isolated():
                 break
             time.sleep(.05)
         else:
-            raise AssertionError("Disposable keyring did not start")
+            daemon_log.seek(0)
+            raise AssertionError("Disposable keyring did not start: " + daemon_log.read())
         subprocess.run([str(ROOT / "build/relay"), "--test-credentials"], env=env, check=True, timeout=15)
         subprocess.run([sys.executable, str(ROOT / "tests/test_vnc.py"), "remember", "remember-rejected"], env=env, check=True, timeout=35)
         unavailable = subprocess.run([str(ROOT / "build/relay"), "--test-credentials"],
@@ -34,6 +36,7 @@ def isolated():
     finally:
         daemon.terminate()
         daemon.wait(timeout=5)
+        daemon_log.close()
 
 if "--isolated" in sys.argv:
     isolated()
