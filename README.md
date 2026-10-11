@@ -27,7 +27,7 @@ L’interfaccia è in italiano. Sviluppato e verificato su Arch Linux / Omarchy.
 Installa le dipendenze:
 
 ```sh
-sudo pacman -S --needed gcc make pkgconf qt6-base qt6-declarative qt6-wayland qt6-svg libvncserver libsecret python
+sudo pacman -S --needed gcc make pkgconf qt6-base qt6-declarative qt6-wayland qt6-svg libvncserver libsecret python inter-font
 ```
 
 Per ricordare le password serve un servizio compatibile con Secret Service,

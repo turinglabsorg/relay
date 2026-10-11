@@ -10,7 +10,7 @@ jobs:
     container: archlinux:base
     steps:
       - name: Install dependencies
-        run: pacman -Syu --noconfirm --needed git gcc make pkgconf qt6-base qt6-declarative qt6-wayland qt6-svg libvncserver libsecret python dbus gnome-keyring ttf-inter
+        run: pacman -Syu --noconfirm --needed git gcc make pkgconf qt6-base qt6-declarative qt6-wayland qt6-svg libvncserver libsecret python dbus gnome-keyring inter-font
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Build
         run: make -j2
