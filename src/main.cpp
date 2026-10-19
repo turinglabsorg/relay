@@ -8,6 +8,9 @@
 #include <QTimer>
 #include <QQuickWindow>
 #include <QTextStream>
+#include <QElapsedTimer>
+#include <QMouseEvent>
+#include <QKeyEvent>
 #include <signal.h>
 
 int main(int argc, char **argv) {
@@ -59,6 +62,15 @@ int main(int argc, char **argv) {
         require(remoteKey(Qt::Key_E, "€") == (0x01000000u | 0x20ac),"Unicode keysym");
         require(fittedRect({1920,1080},{1000,1000}) == QRectF(0,218.75,1000,562.5),"Letterbox coordinates");
         require(fittedRect({},{1000,1000}).isEmpty(),"Empty framebuffer");
+        require(unitedDirtyRect({0,0,2,2},{3,2,4,4},{8,6}) == QRect(0,0,7,6),"Dirty rect union and clipping");
+        require(unitedDirtyRect({},{9,9,2,2},{8,6}).isEmpty(),"Dirty rect outside framebuffer");
+        {
+            QImage source(4, 3, QImage::Format_RGB32); source.fill(QColor("#1234ab"));
+            QImage target(4, 3, QImage::Format_RGB32); target.fill(QColor("#000000"));
+            require(copyImageRegion(target, source, {1,1,2,1}),"Partial frame copy");
+            require(target.pixelColor(1,1) == QColor("#1234ab") && target.pixelColor(0,0) == QColor("#000000"),
+                "Partial frame copy bounds");
+        }
         QTextStream(stdout) << "PASS input mapping and viewport geometry\n";
         return 0;
     }
@@ -127,10 +139,41 @@ int main(int argc, char **argv) {
                 << ' ' << hotspot.x() << ',' << hotspot.y() << ' ' << image.pixelColor(0,0).name()
                 << ' ' << image.pixelColor(1,0).alpha() << '\n';
         });
+        const bool viewInputTest = args.contains("--test-view-input");
+        bool viewInputSent = false;
         QObject::connect(&session, &Session::frameReady, &app, [&,expectedPixel](const QImage &image) {
             QTextStream(stdout) << "FRAME " << image.width() << 'x' << image.height() << ' ' << image.pixelColor(0,0).name() << '\n';
-            session.pointer(2,1,1); session.pointer(2,1,0);
-            session.key('a',true); session.key('a',false);
+            if (viewInputTest) {
+                if (!viewInputSent && (image.size()==QSize(8,6) || image.size()==QSize(9,6) || image.size()==QSize(64,6))) {
+                    viewInputSent = true;
+                    auto *window = qobject_cast<QQuickWindow *>(engine.rootObjects().first());
+                    auto *view = window ? window->findChild<RemoteView *>() : nullptr;
+                    QTextStream(stdout) << "VIEWINPUT view=" << (view != nullptr)
+                        << " focus=" << (window && window->activeFocusItem() ? window->activeFocusItem()->metaObject()->className() : "none") << '\n';
+                    if (view && window) {
+                        const QPointF centre = view->mapToScene(QPointF(view->width()/2, view->height()/2));
+                        QMouseEvent press(QEvent::MouseButtonPress, centre, Qt::LeftButton, Qt::LeftButton, Qt::NoModifier);
+                        QCoreApplication::sendEvent(window, &press);
+                        QMouseEvent release(QEvent::MouseButtonRelease, centre, Qt::LeftButton, Qt::NoButton, Qt::NoModifier);
+                        QCoreApplication::sendEvent(window, &release);
+                        QKeyEvent keyDown(QEvent::KeyPress, Qt::Key_A, Qt::NoModifier, "a");
+                        QCoreApplication::sendEvent(window, &keyDown);
+                        QKeyEvent keyUp(QEvent::KeyRelease, Qt::Key_A, Qt::NoModifier, "a");
+                        QCoreApplication::sendEvent(window, &keyUp);
+                        // A modifier whose release was lost (compositor took it)
+                        // must not turn the next click into a Mac Ctrl+click.
+                        QKeyEvent metaDown(QEvent::KeyPress, Qt::Key_Meta, Qt::MetaModifier, "");
+                        QCoreApplication::sendEvent(window, &metaDown);
+                        QMouseEvent press2(QEvent::MouseButtonPress, centre, Qt::LeftButton, Qt::LeftButton, Qt::NoModifier);
+                        QCoreApplication::sendEvent(window, &press2);
+                        QMouseEvent release2(QEvent::MouseButtonRelease, centre, Qt::LeftButton, Qt::NoButton, Qt::NoModifier);
+                        QCoreApplication::sendEvent(window, &release2);
+                    }
+                }
+            } else {
+                session.pointer(2,1,1); session.pointer(2,1,0);
+                session.key('a',true); session.key('a',false);
+            }
             if (image.size()==QSize(8,6) || image.size()==QSize(9,6) || image.size()==QSize(64,6)) {
                 if (image.pixelColor(0,0)!=expectedPixel || image.pixelColor(image.width()-1,image.height()-1)!=expectedPixel) app.exit(3);
                 else QTimer::singleShot(100, &app, [&,expectedPixel] {
@@ -190,6 +233,19 @@ int main(int argc, char **argv) {
             if (cancelTest && session.state()=="loading") QTimer::singleShot(200,&session,&Session::disconnectRemote);
             if (cancelTest && session.state()=="idle") { QTextStream(stdout)<<"CANCELLED\n"; app.exit(0); }
         });
+        if (args.contains("--test-input-during-frame")) {
+            auto *inputTimer = new QTimer(&app);
+            auto *inputClock = new QElapsedTimer();
+            inputTimer->setInterval(20);
+            QObject::connect(inputTimer, &QTimer::timeout, &app, [inputTimer, inputClock, &session] {
+                if (session.state() != "connected") return;
+                if (!inputClock->isValid()) { inputClock->start(); return; }
+                if (inputClock->elapsed() < 300) return;
+                session.pointer(3, 2, 1); session.pointer(3, 2, 0);
+                inputTimer->stop(); inputTimer->deleteLater(); delete inputClock;
+            });
+            inputTimer->start();
+        }
         QTimer::singleShot(0,&app,[&,endpoint] {
             if (rememberTest) {
                 session.savePreferences(endpoint[0], endpoint[1].toInt(), "synthetic-user", true);

@@ -22,6 +22,8 @@
 #include <algorithm>
 #include <new>
 #include <sys/socket.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <unistd.h>
 
 namespace {
@@ -66,6 +68,12 @@ struct VncHooks {
             [](void *data) { delete[] static_cast<uchar *>(data); }, pixels);
         if (image.isNull()) { delete[] pixels; return FALSE; }
         w->m_buffer = std::move(image);
+        for (int i = 0; i < 3; ++i) { w->m_snapshots[i] = {}; w->m_snapshotSeq[i] = -1; }
+        w->m_dirtyHistory.clear();
+        w->m_presentSeq = 0;
+        w->m_snapshotNext = 0;
+        w->m_frameDirty = w->m_buffer.rect();
+        w->m_dirty = true;
         c->frameBuffer = w->m_buffer.bits();
         c->format.bitsPerPixel = bytes*8;
         c->format.depth = w->m_lowBandwidth ? 16 : 24;
@@ -78,7 +86,13 @@ struct VncHooks {
         c->format.blueShift = 0;
         return TRUE;
     }
-    static void update(rfbClient *c, int, int, int, int) { worker(c)->m_dirty = true; }
+    static void update(rfbClient *c, int x, int y, int w, int h) {
+        auto *clientWorker = worker(c);
+        clientWorker->noteDirty({x, y, w, h});
+        // Flush queued input between rects so a large update cannot
+        // hold mouse/key events until the whole frame has arrived.
+        clientWorker->drainInputs(c);
+    }
     static void cursor(rfbClient *c, int x, int y, int width, int height, int bpp) {
         QImage image;
         if (width > 0 && height > 0 && width <= 512 && height <= 512
@@ -136,6 +150,83 @@ QImage VncWorker::latestFrame() {
     m_notificationPending = false;
     return m_latest;
 }
+QRect unitedDirtyRect(QRect current, QRect addition, QSize bounds) {
+    if (addition.isEmpty() || bounds.isEmpty()) return current;
+    addition = addition.intersected(QRect(QPoint(), bounds));
+    if (addition.isEmpty()) return current;
+    return current.isEmpty() ? addition : current.united(addition);
+}
+bool copyImageRegion(QImage &dst, const QImage &src, QRect rect) {
+    if (dst.isNull() || dst.size() != src.size() || dst.format() != src.format()) return false;
+    rect = rect.intersected(src.rect());
+    if (rect.isEmpty()) return true;
+    const int bytesPerPixel = src.depth() / 8;
+    if (bytesPerPixel <= 0) return false;
+    const qsizetype rowBytes = qsizetype(rect.width()) * bytesPerPixel;
+    for (int row = 0; row < rect.height(); ++row) {
+        auto *target = dst.scanLine(rect.y() + row) + qsizetype(rect.x()) * bytesPerPixel;
+        const auto *source = src.constScanLine(rect.y() + row) + qsizetype(rect.x()) * bytesPerPixel;
+        std::memcpy(target, source, size_t(rowBytes));
+    }
+    return true;
+}
+void VncWorker::noteDirty(QRect rect) {
+    if (m_buffer.isNull()) return;
+    const QRect clipped = unitedDirtyRect({}, rect, m_buffer.size());
+    if (clipped.isEmpty()) return;
+    m_dirty = true;
+    m_frameDirty = unitedDirtyRect(m_frameDirty, clipped, m_buffer.size());
+    ++m_statsRects;
+}
+bool VncWorker::drainInputs(rfbClient *client) {
+    if (!client || m_sendFailed) return !m_sendFailed;
+    std::deque<InputEvent> events;
+    { QMutexLocker lock(&m_queueMutex); events.swap(m_queue); }
+    for (auto &event : events) {
+        m_maxInputDelayMs = std::max(m_maxInputDelayMs, monotonicMs() - event.queuedAt);
+        const rfbBool sent = event.type == InputEvent::Pointer
+            ? SendPointerEvent(client, event.x, event.y, event.mask)
+            : SendKeyEvent(client, event.key, event.down);
+        if (!sent) { m_sendFailed = true; return false; }
+    }
+    return true;
+}
+bool VncWorker::presentFrame() {
+    if (m_buffer.isNull()) return false;
+    const qint64 sequence = ++m_presentSeq;
+    m_dirtyHistory.emplace_back(sequence, m_frameDirty);
+    const int index = m_snapshotNext;
+    m_snapshotNext = (m_snapshotNext + 1) % 3;
+    QImage &snapshot = m_snapshots[index];
+    const bool full = snapshot.size() != m_buffer.size()
+        || snapshot.format() != m_buffer.format() || m_snapshotSeq[index] < 0;
+    QRect region = m_buffer.rect();
+    if (!full) {
+        region = {};
+        for (const auto &entry : m_dirtyHistory)
+            if (entry.first > m_snapshotSeq[index])
+                region = unitedDirtyRect(region, entry.second, m_buffer.size());
+        if (region.isEmpty()) region = m_frameDirty;
+    }
+    if (full || !snapshot.isDetached()) snapshot = m_buffer.copy();
+    else copyImageRegion(snapshot, m_buffer, region);
+    m_snapshotSeq[index] = sequence;
+    qint64 oldest = sequence;
+    for (qint64 seen : m_snapshotSeq) if (seen >= 0) oldest = std::min(oldest, seen);
+    while (!m_dirtyHistory.empty() && m_dirtyHistory.front().first <= oldest)
+        m_dirtyHistory.pop_front();
+    m_statsDirtyArea += qint64(m_frameDirty.width()) * m_frameDirty.height();
+    ++m_statsPresented;
+    bool notify = false;
+    {
+        QMutexLocker lock(&m_frameMutex);
+        m_latest = snapshot;
+        if (!m_notificationPending) { m_notificationPending = true; notify = true; }
+    }
+    m_dirty = false;
+    m_frameDirty = {};
+    return notify;
+}
 void VncWorker::run() {
     if (m_stop) { emit ended({}); return; }
     auto *c = rfbGetClient(8, 3, 4);
@@ -155,9 +246,9 @@ void VncWorker::run() {
     c->appData.shareDesktop = TRUE;
     c->appData.useRemoteCursor = TRUE;
     c->appData.enableJPEG = TRUE;
-    c->appData.qualityLevel = 6;
-    c->appData.compressLevel = m_lowBandwidth ? 5 : 2;
-    c->appData.encodingsString = "copyrect tight zlib zrle hextile raw";
+    c->appData.qualityLevel = m_lowBandwidth ? 4 : 7;
+    c->appData.compressLevel = m_lowBandwidth ? 7 : 3;
+    c->appData.encodingsString = "copyrect tight zrle zlib hextile raw";
     const bool initialized = rfbInitClient(c, nullptr, nullptr);
     m_password.fill('\0'); m_password.clear();
     if (!initialized) {
@@ -167,52 +258,60 @@ void VncWorker::run() {
         return;
     }
     trackSocket(c->sock);
+    // Pointer/key packets are tiny: Nagle would hold them behind delayed
+    // ACKs and add tens of ms of input latency on Wi-Fi/Tailscale paths.
+    const int noDelay = 1;
+    ::setsockopt(c->sock, IPPROTO_TCP, TCP_NODELAY, &noDelay, sizeof(noDelay));
+#ifdef TCP_QUICKACK
+    ::setsockopt(c->sock, IPPROTO_TCP, TCP_QUICKACK, &noDelay, sizeof(noDelay));
+#endif
     // LibVNCClient counts partial-read retries, not wall-clock inactivity.
     // A large frame over a relay can exceed that count despite making progress.
     // Streaming reads are interrupted explicitly via shutdown() on cancellation.
     c->readTimeout = 0;
-    QTextStream(stderr) << "Relay profile: " << (m_lowBandwidth ? "Fluido / RGB565" : "Qualità / RGB888") << '\n';
+    QTextStream(stderr) << "Relay profile: " << (m_lowBandwidth ? "Fluido / RGB565" : "Qualità / RGB888")
+        << "; desktop " << c->width << 'x' << c->height << '\n';
     emit authenticated();
     QElapsedTimer frameClock; frameClock.start();
     QElapsedTimer statsClock; statsClock.start();
-    qint64 maxDecodeMs = 0, maxInputDelayMs = 0;
+    qint64 maxDecodeMs = 0;
     int updates = 0;
     bool healthy = true;
     while (!m_stop && healthy) {
-        std::deque<InputEvent> events;
-        { QMutexLocker lock(&m_queueMutex); events.swap(m_queue); }
-        for (auto &event : events) {
-            maxInputDelayMs = std::max(maxInputDelayMs, monotonicMs() - event.queuedAt);
-            if (event.type == InputEvent::Pointer)
-                healthy = SendPointerEvent(c, event.x, event.y, event.mask);
-            else if (event.type == InputEvent::Key)
-                healthy = SendKeyEvent(c, event.key, event.down);
-            if (!healthy) break;
-        }
-        if (!healthy) break;
+        if (!drainInputs(c)) break;
         // ReadFromRFBServer can prefetch several messages in one socket read.
         // select() cannot see those bytes; waiting only on the socket can leave
         // the last frame buffered forever and stop the update-request cycle.
-        const int ready = c->buffered > 0 ? 1 : WaitForMessage(c, 10000);
+        const int ready = c->buffered > 0 ? 1 : WaitForMessage(c, 1000);
         QElapsedTimer decodeClock; decodeClock.start();
         if (ready < 0 || (ready > 0 && !HandleRFBServerMessage(c))) { healthy = false; break; }
+        if (m_sendFailed) { healthy = false; break; }
         if (ready > 0) { ++updates; maxDecodeMs = std::max(maxDecodeMs, decodeClock.elapsed()); }
-        if (m_dirty && frameClock.elapsed() >= 30) {
-            bool notify = false;
-            {
-                QMutexLocker lock(&m_frameMutex);
-                m_latest = m_buffer.copy();
-                if (!m_notificationPending) { m_notificationPending = true; notify = true; }
+        if (m_dirty) {
+            // Present small changes almost immediately and cap full-screen
+            // changes at ~60 fps: copy and texture conversion of a
+            // 1920x1200 frame measure well under 1 ms on this class of
+            // hardware, so a 33 ms hold only adds visible input latency.
+            const qint64 framePixels = qint64(m_buffer.width()) * m_buffer.height();
+            const qint64 dirtyPixels = qint64(m_frameDirty.width()) * m_frameDirty.height();
+            const qint64 interval = framePixels > 0 && dirtyPixels * 4 <= framePixels ? 8 : 16;
+            if (frameClock.elapsed() >= interval) {
+                const bool notify = presentFrame();
+                frameClock.restart();
+                if (notify) emit frameAvailable();
             }
-            m_dirty = false;
-            frameClock.restart();
-            if (notify) emit frameAvailable();
         }
         if (statsClock.elapsed() >= 5000) {
-            QTextStream(stderr) << "Relay performance: " << updates << " messages / "
-                << statsClock.elapsed() << " ms; max receive/decode " << maxDecodeMs
-                << " ms; max input queue " << maxInputDelayMs << " ms\n";
-            statsClock.restart(); updates = 0; maxDecodeMs = maxInputDelayMs = 0;
+            const qint64 framePixels = qint64(m_buffer.width()) * m_buffer.height();
+            const qint64 dirtyPercent = m_statsPresented > 0 && framePixels > 0
+                ? m_statsDirtyArea * 100 / (qint64(m_statsPresented) * framePixels) : 0;
+            QTextStream(stderr) << "Relay performance: " << updates << " messages, "
+                << m_statsPresented << " presented, " << m_statsRects << " rects / "
+                << statsClock.elapsed() << " ms; dirty ~" << dirtyPercent
+                << "%/frame; max receive/decode " << maxDecodeMs
+                << " ms; max input queue " << m_maxInputDelayMs << " ms\n";
+            statsClock.restart(); updates = 0; maxDecodeMs = 0;
+            m_maxInputDelayMs = 0; m_statsRects = 0; m_statsPresented = 0; m_statsDirtyArea = 0;
         }
     }
     c->frameBuffer = nullptr;
@@ -485,12 +584,28 @@ bool RemoteView::sendPointer(QPointF position, Qt::MouseButtons buttons, int whe
     if (wheel) m_session->pointer(x,y,mask);
     return true;
 }
-void RemoteView::mousePressEvent(QMouseEvent *e) { forceActiveFocus(); sendPointer(e->position(), e->buttons()); e->accept(); }
+void RemoteView::releaseStaleModifiers(Qt::KeyboardModifiers modifiers, int exceptKey) {
+    if (!m_session) return;
+    // A modifier release can be swallowed by the compositor (e.g. Super used
+    // for a window shortcut). Left down on the Mac it turns clicks into
+    // Ctrl+clicks and letters into shortcuts, so heal it as soon as a later
+    // event proves the key is no longer physically held.
+    const struct { int key; Qt::KeyboardModifier flag; } tracked[] = {
+        {Qt::Key_Shift, Qt::ShiftModifier}, {Qt::Key_Control, Qt::ControlModifier},
+        {Qt::Key_Alt, Qt::AltModifier}, {Qt::Key_Meta, Qt::MetaModifier},
+    };
+    for (const auto &entry : tracked) {
+        if (entry.key == exceptKey || (modifiers & entry.flag)) continue;
+        if (const quint32 remote = m_pressedKeys.take(entry.key)) m_session->key(remote, false);
+    }
+}
+void RemoteView::mousePressEvent(QMouseEvent *e) { forceActiveFocus(); releaseStaleModifiers(e->modifiers()); sendPointer(e->position(), e->buttons()); e->accept(); }
 void RemoteView::mouseReleaseEvent(QMouseEvent *e) {
-    // A release outside the letterboxed image must still reach the Mac.
-    sendPointer(e->position(), e->buttons() | e->button());
-    if (m_session) m_session->pointer(m_lastPointer.x(), m_lastPointer.y(),
-        (e->buttons().testFlag(Qt::LeftButton)?1:0) | (e->buttons().testFlag(Qt::MiddleButton)?2:0) | (e->buttons().testFlag(Qt::RightButton)?4:0));
+    // Send exactly one release. A release outside the letterboxed image must
+    // still reach the Mac, at the last in-image position.
+    if (!sendPointer(e->position(), e->buttons()) && m_session)
+        m_session->pointer(m_lastPointer.x(), m_lastPointer.y(),
+            (e->buttons().testFlag(Qt::LeftButton)?1:0) | (e->buttons().testFlag(Qt::MiddleButton)?2:0) | (e->buttons().testFlag(Qt::RightButton)?4:0));
     e->accept();
 }
 void RemoteView::mouseMoveEvent(QMouseEvent *e) { sendPointer(e->position(), e->buttons()); e->accept(); }
@@ -503,6 +618,7 @@ void RemoteView::wheelEvent(QWheelEvent *e) {
 }
 void RemoteView::keyPressEvent(QKeyEvent *e) {
     if (e->key() == Qt::Key_F11 && m_pressedKeys.isEmpty()) { e->ignore(); return; }
+    releaseStaleModifiers(e->modifiers(), e->key());
     quint32 key = remoteKey(e->key(), e->text());
     if (m_session && m_session->macShortcuts()) {
         if (e->key() == Qt::Key_Control) key = XK_Super_L;

@@ -2,6 +2,7 @@
 
 #include <QImage>
 #include <QCursor>
+#include <QRect>
 #include <QMutex>
 #include <QObject>
 #include <QQuickItem>
@@ -14,6 +15,9 @@
 #include <deque>
 #include <set>
 #include "credentials.h"
+
+struct _rfbClient;
+typedef struct _rfbClient rfbClient;
 
 struct InputEvent {
     enum Type { Pointer, Key } type = Pointer;
@@ -49,10 +53,24 @@ private:
     QMutex m_socketMutex;
     int m_socket = -1;
     void trackSocket(int socket);
+    bool drainInputs(rfbClient *client);
+    void noteDirty(QRect rect);
+    bool presentFrame();
     std::deque<InputEvent> m_queue;
     std::atomic<bool> m_stop{false};
     bool m_notificationPending = false;
     bool m_dirty = false;
+    bool m_sendFailed = false;
+    QRect m_frameDirty;
+    qint64 m_maxInputDelayMs = 0;
+    int m_statsRects = 0;
+    int m_statsPresented = 0;
+    qint64 m_statsDirtyArea = 0;
+    QImage m_snapshots[3];
+    qint64 m_snapshotSeq[3] = {-1, -1, -1};
+    int m_snapshotNext = 0;
+    qint64 m_presentSeq = 0;
+    std::deque<std::pair<qint64, QRect>> m_dirtyHistory;
 };
 
 class Session : public QObject {
@@ -129,6 +147,8 @@ private:
 
 quint32 remoteKey(int qtKey, const QString &text);
 QRectF fittedRect(QSize image, QSizeF viewport);
+QRect unitedDirtyRect(QRect current, QRect addition, QSize bounds);
+bool copyImageRegion(QImage &dst, const QImage &src, QRect rect);
 
 class RemoteView : public QQuickItem {
     Q_OBJECT
@@ -153,6 +173,7 @@ protected:
     void focusOutEvent(QFocusEvent *event) override;
 private:
     bool sendPointer(QPointF position, Qt::MouseButtons buttons, int wheel = 0);
+    void releaseStaleModifiers(Qt::KeyboardModifiers modifiers, int exceptKey = 0);
     Session *m_session = nullptr;
     QImage m_image;
     quint64 m_frameVersion = 0;

@@ -1,6 +1,7 @@
 """Exercise the actual LibVNCClient connection and Qt framebuffer with a local RFB peer."""
 import os
 from pathlib import Path
+import select
 import socket
 import struct
 import subprocess
@@ -40,6 +41,7 @@ def run_case(mode):
     low = mode == "low-bandwidth"
     initial_width = 5 if low else 4
     errors, inputs = [], []
+    responsive = {"before_complete": False, "data": bytearray()}
     listener = socket.socket()
     listener.bind(("127.0.0.1", 0))
     listener.listen(1)
@@ -94,7 +96,7 @@ def run_case(mode):
                         elif step == 1:
                             # Wait so Qt sees the first frame as well as the resize.
                             time.sleep(.15)
-                            if mode in ("resize", "remember"):
+                            if mode in ("resize", "remember", "view-input"):
                                 conn.sendall(framebuffer(8, 6, 0x1234AB, resize=True))
                             elif mode == "buffered-burst":
                                 # Bell and a frame arrive together; the decoder prefetches
@@ -106,6 +108,60 @@ def run_case(mode):
                                 for i in range(28,len(packet),4):
                                     conn.sendall(packet[i:i+4])
                                     time.sleep(.003)
+                            elif mode == "responsive-input":
+                                # One update with many raw tiles, dribbled out.
+                                # A responsive client flushes queued pointer
+                                # input between rects instead of waiting for
+                                # the whole update to arrive.
+                                tiles = []
+                                for ty in (0, 2, 4):
+                                    for tx in (0, 2, 4, 6):
+                                        tiles.append(struct.pack("!HHHHi", tx, ty, 2, 2, 0)
+                                                     + pixel_bytes(0x1234AB) * 4)
+                                header = struct.pack("!BBH", 0, 0, 1 + len(tiles))
+                                header += struct.pack("!HHHHi", 0, 0, 8, 6, -223)
+                                pieces = [header] + tiles
+                                # Drain input queued by the first frame so
+                                # only input sent during this update counts.
+                                time.sleep(.12)
+                                while select.select([conn], [], [], 0)[0]:
+                                    chunk = conn.recv(4096)
+                                    if not chunk:
+                                        break
+                                    while chunk:
+                                        if chunk[0] == 5 and len(chunk) >= 6:
+                                            mask, x, y = struct.unpack("!BHH", chunk[1:6])
+                                            inputs.append(("pointer", x, y, mask))
+                                            chunk = chunk[6:]
+                                        elif chunk[0] == 3 and len(chunk) >= 10:
+                                            chunk = chunk[10:]
+                                        elif chunk[0] == 4 and len(chunk) >= 8:
+                                            chunk = chunk[8:]
+                                        else:
+                                            chunk = b""
+                                for index, piece in enumerate(pieces):
+                                    conn.sendall(piece)
+                                    if index < len(pieces) - 1:
+                                        time.sleep(.04)
+                                        ready, _, _ = select.select([conn], [], [], 0)
+                                        if ready:
+                                            chunk = conn.recv(4096)
+                                            if chunk:
+                                                responsive["data"] += chunk
+                                                if chunk[0] == 5:
+                                                    responsive["before_complete"] = True
+                                pending = bytes(responsive["data"])
+                                while pending:
+                                    if pending[0] == 5 and len(pending) >= 6:
+                                        mask, x, y = struct.unpack("!BHH", pending[1:6])
+                                        inputs.append(("pointer", x, y, mask))
+                                        pending = pending[6:]
+                                    elif pending[0] == 3 and len(pending) >= 10:
+                                        pending = pending[10:]
+                                    elif pending[0] == 4 and len(pending) >= 8:
+                                        pending = pending[8:]
+                                    else:
+                                        break
                             elif mode in ("zlib-cursor", "low-bandwidth"):
                                 # A rich cursor with a transparent pixel followed by
                                 # a compressed resized desktop in the same packet.
@@ -159,6 +215,10 @@ def run_case(mode):
             arguments.append("--test-cancel")
         if mode in ("remember", "remember-rejected"):
             arguments.append("--test-remember")
+        if mode == "responsive-input":
+            arguments.append("--test-input-during-frame")
+        if mode == "view-input":
+            arguments.append("--test-view-input")
         if low:
             arguments.append("--test-low-bandwidth")
         result = subprocess.run(arguments, env=env, capture_output=True, text=True, timeout=15)
@@ -170,7 +230,7 @@ def run_case(mode):
     thread.join(3)
     assert not errors, errors
     assert "ReferenceError" not in result.stderr and "TypeError" not in result.stderr, result.stderr
-    expected = 0 if mode in ("resize", "buffered-burst", "slow-frame", "zlib-cursor", "low-bandwidth", "cancel", "remember") else 4
+    expected = 0 if mode in ("resize", "buffered-burst", "slow-frame", "zlib-cursor", "low-bandwidth", "cancel", "remember", "responsive-input", "view-input") else 4
     assert result.returncode == expected, (mode, result.returncode, result.stdout, result.stderr)
     if mode == "cancel":
         assert "CANCELLED" in result.stdout, result.stdout
@@ -179,18 +239,37 @@ def run_case(mode):
     if low:
         assert "CURSOR 3x2 1,0 #adcfef 0" in result.stdout, result.stdout
         assert "Relay profile: Fluido / RGB565" in result.stderr, result.stderr
-    if mode in ("resize", "buffered-burst", "slow-frame", "zlib-cursor", "low-bandwidth", "remember"):
+    if mode == "responsive-input":
+        assert responsive["before_complete"], ("pointer input waited for the full framebuffer update", responsive, inputs, result.stdout, result.stderr)
+        assert ("pointer", 3, 2, 1) in inputs and ("pointer", 3, 2, 0) in inputs, inputs
+    if mode in ("resize", "buffered-burst", "slow-frame", "zlib-cursor", "low-bandwidth", "remember", "responsive-input", "view-input"):
         assert "RENDER pixels and letterbox after window resize" in result.stdout, result.stdout
         initial = "5x3 #ef4931" if low else "4x3 #ef4a32"
         assert f"FRAME {initial}" in result.stdout, result.stdout
         size = "64x6" if mode == "slow-frame" else "9x6" if low else "8x6"
         color = "#1034ad" if low else "#1234ab"
         assert f"FRAME {size} {color}" in result.stdout, result.stdout
-        assert ("pointer", 2, 1, 1) in inputs and ("pointer", 2, 1, 0) in inputs, inputs
+        if mode == "view-input":
+            # Events go through RemoteView (window delivery), not Session directly:
+            # a left click at the image centre and an "a" keypress must arrive.
+            assert "VIEWINPUT view=1" in result.stdout, result.stdout
+            assert ("pointer", 4, 3, 1) in inputs and ("pointer", 4, 3, 0) in inputs, inputs
+            assert not any(i[0] == "pointer" and i[3] == 4 for i in inputs), inputs
+            # Each physical click is one press: a duplicated press is a double-click.
+            assert inputs.count(("pointer", 4, 3, 1)) == 2, inputs
+            # Super arrives on the Mac as Control (0xffe3); a lost release must be
+            # healed before the next click, or macOS sees Ctrl+click (right click).
+            assert ("key", 0xFFE3, 1) in inputs and ("key", 0xFFE3, 0) in inputs, inputs
+            meta_down = inputs.index(("key", 0xFFE3, 1))
+            meta_up = inputs.index(("key", 0xFFE3, 0))
+            clicks_after = [i for i in range(meta_down, len(inputs)) if inputs[i][0] == "pointer" and inputs[i][3] == 1]
+            assert clicks_after and meta_up < clicks_after[0], inputs
+        else:
+            assert ("pointer", 2, 1, 1) in inputs and ("pointer", 2, 1, 0) in inputs, inputs
         assert ("key", ord("a"), 1) in inputs and ("key", ord("a"), 0) in inputs, inputs
     print(f"PASS {mode}: protocol negotiation, framebuffer and event loop")
 
 with tempfile.TemporaryDirectory(prefix="relay-unit-") as config:
     subprocess.run([str(ROOT / "build/relay"), "--self-test"], env=os.environ | {"QT_QPA_PLATFORM":"offscreen", "QT_QPA_PLATFORMTHEME":"", "QT_STYLE_OVERRIDE":"", "XDG_CONFIG_HOME":config}, check=True)
-for mode in (sys.argv[1:] or ("resize", "buffered-burst", "slow-frame", "zlib-cursor", "low-bandwidth", "cancel", "disconnect", "oversized", "auth-rejected")):
+for mode in (sys.argv[1:] or ("resize", "buffered-burst", "slow-frame", "responsive-input", "view-input", "zlib-cursor", "low-bandwidth", "cancel", "disconnect", "oversized", "auth-rejected")):
     run_case(mode)
