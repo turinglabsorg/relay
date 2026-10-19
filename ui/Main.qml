@@ -267,7 +267,7 @@ ApplicationWindow {
             ActionButton { label: "Fluido"; dark: root.dark; accent: session.lowBandwidth; Layout.fillWidth: true; onClicked: session.setLowBandwidth(true) }
             ActionButton { label: "Qualità"; dark: root.dark; accent: !session.lowBandwidth; Layout.fillWidth: true; onClicked: session.setLowBandwidth(false) }
         }
-        Text { text: session.lowBandwidth ? "Meno dati, colori a 16 bit. Consigliato su Internet." : "Tutte le sfumature, con maggiore traffico di rete."; color: root.muted; font.pixelSize: 12; wrapMode: Text.WordWrap; Layout.fillWidth: true }
+        Text { text: session.lowBandwidth ? "Meno dati, colori a 16 bit. Consigliato su Internet." : "Codec adattivo del Mac: nitido sul testo, leggero sulle foto."; color: root.muted; font.pixelSize: 12; wrapMode: Text.WordWrap; Layout.fillWidth: true }
         Toggle { text: "Usa Ctrl come Command (⌘) sul Mac"; dark: root.dark; checked: session.macShortcuts; Layout.fillWidth: true; onToggled: session.setMacShortcuts(checked) }
         ActionButton { label: "Dimentica password"; dark: root.dark; Layout.fillWidth: true; enabled: session.remembersPassword(session.username); onClicked: session.forgetPassword(session.username) }
         actions: [ ActionButton { objectName: "preferencesAction"; Layout.fillWidth: true; label: "Salva impostazioni"; accent: true; enabled: prefHost.text.trim().length > 0 && !/[\s/]/.test(prefHost.text.trim()) && prefPort.acceptableInput; onClicked: { session.savePreferences(prefHost.text, Number(prefPort.text), prefUser.text, session.dark); session.setDisplayName(prefName.text); preferences.close() } } ]

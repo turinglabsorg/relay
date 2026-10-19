@@ -27,6 +27,22 @@ struct InputEvent {
     qint64 queuedAt = 0;
 };
 
+struct AppleReader {
+    int fd = -1;
+    const std::atomic<bool> *stop = nullptr;
+    QByteArray buf;
+    qsizetype at = 0;
+    quint64 total = 0;
+    bool fill();
+    void compact();
+    bool read(void *out, qsizetype size);
+    bool skip(qsizetype size);
+    bool u8(quint8 &value);
+    bool u16(quint16 &value);
+    bool u32(quint32 &value);
+    bool i32(qint32 &value);
+};
+
 class VncWorker : public QThread {
     Q_OBJECT
 public:
@@ -55,6 +71,18 @@ private:
     void trackSocket(int socket);
     bool drainInputs(rfbClient *client);
     bool sendNow(const InputEvent &event);
+    bool tryApple();
+    bool appleSession(int fd);
+    bool appleReadLoop(AppleReader &reader);
+    bool appleAllocBuffer(int width, int height);
+    bool appleLayout(const QByteArray &payload);
+    bool appleWriteAll(const QByteArray &data);
+    bool appleSendInput(const InputEvent &event);
+    int m_appleFd = -1;
+    bool m_appleMode = false;
+    bool m_appleScaleSent = false;
+    double m_appleScale = 1.0;
+    void *m_appleInflate = nullptr;
     void noteDirty(QRect rect);
     bool presentFrame();
     std::deque<InputEvent> m_queue;
@@ -152,6 +180,7 @@ quint32 remoteKey(int qtKey, const QString &text);
 QRectF fittedRect(QSize image, QSizeF viewport);
 QRect unitedDirtyRect(QRect current, QRect addition, QSize bounds);
 bool copyImageRegion(QImage &dst, const QImage &src, QRect rect);
+bool relayCodecSelfTest();
 
 class RemoteView : public QQuickItem {
     Q_OBJECT

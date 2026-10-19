@@ -71,6 +71,7 @@ int main(int argc, char **argv) {
             require(target.pixelColor(1,1) == QColor("#1234ab") && target.pixelColor(0,0) == QColor("#000000"),
                 "Partial frame copy bounds");
         }
+        require(relayCodecSelfTest(), "ZRLE and Apple adaptive codecs");
         QTextStream(stdout) << "PASS input mapping and viewport geometry\n";
         return 0;
     }
@@ -130,7 +131,11 @@ int main(int argc, char **argv) {
     if (testIndex >= 0 && testIndex+1 < args.size()) {
         const bool lowBandwidthTest = args.contains("--test-low-bandwidth");
         session.setLowBandwidth(lowBandwidthTest);
-        const QColor expectedPixel(lowBandwidthTest ? "#1034ad" : "#1234ab");
+        // Fluido on the Apple path stores thousands-color as RGB555. Qt's
+        // 16-bit round trip of #1234ab is #1030ad there, and #1034ad on the
+        // ordinary RGB565 path.
+        const QColor expectedPixel(args.contains("--test-apple") && lowBandwidthTest ? "#1030ad"
+            : lowBandwidthTest ? "#1034ad" : "#1234ab");
         const bool cancelTest = args.contains("--test-cancel");
         auto endpoint=args[testIndex+1].split(':');
         if (endpoint.size()!=2) return 2;
@@ -250,7 +255,8 @@ int main(int argc, char **argv) {
             if (rememberTest) {
                 session.savePreferences(endpoint[0], endpoint[1].toInt(), "synthetic-user", true);
                 session.connectRemote("synthetic-user", testSecret, true);
-            } else session.connectEndpoint(endpoint[0],endpoint[1].toInt(),{},{});
+            } else if (args.contains("--test-apple")) session.connectEndpoint(endpoint[0],endpoint[1].toInt(),"relay","segreto");
+            else session.connectEndpoint(endpoint[0],endpoint[1].toInt(),{},{});
         });
         QTimer::singleShot(10000,&app,[] { QCoreApplication::exit(5); });
     }

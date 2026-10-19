@@ -1,4 +1,5 @@
 """Exercise the actual LibVNCClient connection and Qt framebuffer with a local RFB peer."""
+import hashlib
 import os
 from pathlib import Path
 import select
@@ -37,8 +38,15 @@ def framebuffer(width, height, rgb, resize=False, low=False):
     result += pixel_bytes(rgb, low) * width * height
     return result
 
+APPLE_PRIME = int(
+    "FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD129024E088A67CC74"
+    "020BBEA63B139B22514A08798E3404DDEF9519B3CD3A431B302B0A6DF25F1437"
+    "4FE1356D6D51C245E485B576625E7EC6F44C42E9A637ED6B0BFF5CB6F406B7ED"
+    "EE386BFB5A899FA5AE9F24117C4B1FE649286651ECE65381FFFFFFFFFFFFFFFF", 16)
+
 def run_case(mode):
     low = mode == "low-bandwidth"
+    apple_stats = {"arms": 0, "requests": 0, "pushed": 0}
     initial_width = 5 if low else 4
     errors, inputs = [], []
     responsive = {"before_complete": False, "data": bytearray()}
@@ -49,11 +57,20 @@ def run_case(mode):
 
     def peer():
         try:
-            conn, _ = listener.accept()
+            # Relay first probes the greeting on a throwaway connection to
+            # detect Apple 003.889 servers; like a real server, accept the
+            # real connection that follows it.
+            conn = None
+            while conn is None:
+                candidate, _ = listener.accept()
+                candidate.settimeout(12)
+                candidate.sendall(b"RFB 003.008\n")
+                try:
+                    assert receive(candidate, 12) == b"RFB 003.008\n"
+                    conn = candidate
+                except (EOFError, AssertionError):
+                    candidate.close()
             with conn:
-                conn.settimeout(12)
-                conn.sendall(b"RFB 003.008\n")
-                assert receive(conn, 12) == b"RFB 003.008\n"
                 if mode in ("auth-rejected", "remember-rejected"):
                     conn.sendall(b"\x01\x02")
                     assert receive(conn, 1) == b"\x02"
@@ -203,7 +220,114 @@ def run_case(mode):
         finally:
             listener.close()
 
-    thread = threading.Thread(target=peer, daemon=True)
+    def peer_apple():
+        try:
+            conn, _ = listener.accept()
+            with conn:
+                conn.settimeout(12)
+                conn.sendall(b"RFB 003.889\n")
+                assert receive(conn, 12) == b"RFB 003.889\n"
+                conn.sendall(b"\x01\x1e")
+                assert receive(conn, 1) == b"\x1e"
+                key_len = 128
+                server_priv = int.from_bytes(os.urandom(32), "big")
+                conn.sendall(struct.pack("!HH", 2, key_len)
+                             + APPLE_PRIME.to_bytes(key_len, "big")
+                             + pow(2, server_priv, APPLE_PRIME).to_bytes(key_len, "big"))
+                blob = receive(conn, 128)
+                client_pub = int.from_bytes(receive(conn, key_len), "big")
+                secret = pow(client_pub, server_priv, APPLE_PRIME).to_bytes(key_len, "big")
+                plain = subprocess.run(
+                    ["openssl", "enc", "-d", "-aes-128-ecb", "-K", hashlib.md5(secret).hexdigest(), "-nopad"],
+                    input=blob, capture_output=True).stdout
+                assert plain[0:5] == b"relay" and plain[5] == 0, plain[:16]
+                assert plain[64:71] == b"segreto" and plain[71] == 0
+                conn.sendall(struct.pack("!I", 0))
+                assert receive(conn, 1) == b"\x81"
+                name = bytes(22) + b"Mac Test"
+                conn.sendall(struct.pack("!HH", 4, 3)
+                             + struct.pack("!BBBBHHHBBBxxx", 32, 24, 0, 1, 255, 255, 255, 16, 8, 0)
+                             + struct.pack("!I", len(name)) + name)
+                codec = mode == "apple-codec"
+                compressor = zlib.compressobj()
+                def rgb555(rgb):
+                    word = ((rgb >> 19) & 31) << 10 | ((rgb >> 11) & 31) << 5 | ((rgb >> 3) & 31)
+                    return struct.pack(">H", word)
+                def zlib_rect(w, h, rgb, x=0, y=0):
+                    encoding = 0x3ea if codec else 6
+                    pixels = (rgb555(rgb) if codec else pixel_bytes(rgb)) * (w * h)
+                    chunk = compressor.compress(pixels) + compressor.flush(zlib.Z_SYNC_FLUSH)
+                    return struct.pack("!HHHHi", x, y, w, h, encoding) + struct.pack("!I", len(chunk)) + chunk
+                zrle_stream = zlib.compressobj()
+                def zrle_rect(w, h, rgb, x=0, y=0):
+                    # One solid ZRLE tile. Qualità CPIXEL is little-endian B, G, R.
+                    raw = bytes((1, rgb & 0xFF, (rgb >> 8) & 0xFF, (rgb >> 16) & 0xFF))
+                    chunk = zrle_stream.compress(raw) + zrle_stream.flush(zlib.Z_SYNC_FLUSH)
+                    return struct.pack("!HHHHi", x, y, w, h, 16) + struct.pack("!I", len(chunk)) + chunk
+                record = struct.pack("!ddI", 1.0, 1.0, 1) + struct.pack("!HHHH", 0, 0, 6, 8) \
+                    + struct.pack("!HHHH", 0, 0, 6, 8) + struct.pack("!I", 1) + bytes(16)
+                layout_payload = struct.pack("!HHHHHIIH", 5, 8, 6, 8, 6, 1, 4, 1) + record
+                layout = struct.pack("!HHHHi", 0, 0, 0, 0, 0x451) + struct.pack("!H", len(layout_payload)) + layout_payload
+                stage = 0
+                while True:
+                    message = receive(conn, 1)[0]
+                    if message == 0x21:
+                        receive(conn, 65)
+                    elif message == 0x0a:
+                        receive(conn, 3)
+                    elif message == 0:
+                        receive(conn, 19)
+                    elif message == 2:
+                        head = receive(conn, 3)
+                        count = struct.unpack("!H", head[1:3])[0]
+                        offered = struct.unpack("!" + "i" * count, receive(conn, 4 * count))
+                        assert offered.index(16) < offered.index(6) < offered.index(0), offered
+                        assert 1 in offered, offered
+                        if codec:
+                            assert offered.index(16) < offered.index(0x3ea) < offered.index(6), offered
+                            assert 0x3f3 not in offered, offered
+                        else:
+                            assert offered.index(0x3f3) < offered.index(16), offered
+                            assert 0x3ea not in offered, offered
+                        conn.sendall(struct.pack("!BBH", 0, 0, 1) + zlib_rect(4, 3, 0xEF4A32))
+                        apple_stats["pushed"] += 1
+                        time.sleep(0.2)
+                        conn.sendall(struct.pack("!BBH", 0, 0, 1) + layout)
+                        stage = 1
+                    elif message == 3:
+                        receive(conn, 9)
+                        apple_stats["requests"] += 1
+                    elif message == 9:
+                        arm = receive(conn, 15)
+                        assert arm[1:3] == b"\x00\x01" and arm[3:7] == bytes(4), arm
+                        apple_stats["arms"] += 1
+                        if stage == 1:
+                            stage = 2
+                            if codec:
+                                # Fill, punch out the sampled pixel, then CopyRect it
+                                # back from its neighbour. A skipped copy leaves black.
+                                body = zlib_rect(8, 6, 0x1234AB) + zlib_rect(1, 1, 0)
+                                body += struct.pack("!HHHHiHH", 0, 0, 1, 1, 1, 1, 0)
+                                conn.sendall(struct.pack("!BBH", 0, 0, 3) + body)
+                            else:
+                                conn.sendall(struct.pack("!BBH", 0, 0, 1) + zrle_rect(8, 6, 0x1234AB))
+                            apple_stats["pushed"] += 1
+                    elif message == 4:
+                        data = receive(conn, 7)
+                        inputs.append(("key", struct.unpack("!I", data[3:])[0], data[0]))
+                    elif message == 5:
+                        mask, x, y = struct.unpack("!BHH", receive(conn, 5))
+                        inputs.append(("pointer", x, y, mask))
+                    else:
+                        raise AssertionError(f"unexpected Apple message {message}")
+        except EOFError:
+            pass
+        except Exception as error:
+            errors.append(error)
+        finally:
+            listener.close()
+
+    thread = threading.Thread(target=peer_apple if mode in ("apple", "apple-codec") else peer, daemon=True)
     thread.start()
     with tempfile.TemporaryDirectory(prefix="relay-test-") as config:
         platform = os.environ.get("RELAY_TEST_PLATFORM", "offscreen")
@@ -219,7 +343,9 @@ def run_case(mode):
             arguments.append("--test-input-during-frame")
         if mode == "view-input":
             arguments.append("--test-view-input")
-        if low:
+        if mode in ("apple", "apple-codec"):
+            arguments.append("--test-apple")
+        if low or mode == "apple-codec":
             arguments.append("--test-low-bandwidth")
         result = subprocess.run(arguments, env=env, capture_output=True, text=True, timeout=15)
         for file in Path(config).rglob("*"):
@@ -230,7 +356,7 @@ def run_case(mode):
     thread.join(3)
     assert not errors, errors
     assert "ReferenceError" not in result.stderr and "TypeError" not in result.stderr, result.stderr
-    expected = 0 if mode in ("resize", "buffered-burst", "slow-frame", "zlib-cursor", "low-bandwidth", "cancel", "remember", "responsive-input", "view-input") else 4
+    expected = 0 if mode in ("resize", "buffered-burst", "slow-frame", "zlib-cursor", "low-bandwidth", "cancel", "remember", "responsive-input", "view-input", "apple", "apple-codec") else 4
     assert result.returncode == expected, (mode, result.returncode, result.stdout, result.stderr)
     if mode == "cancel":
         assert "CANCELLED" in result.stdout, result.stdout
@@ -242,12 +368,12 @@ def run_case(mode):
     if mode == "responsive-input":
         assert responsive["before_complete"], ("pointer input waited for the full framebuffer update", responsive, inputs, result.stdout, result.stderr)
         assert ("pointer", 3, 2, 1) in inputs and ("pointer", 3, 2, 0) in inputs, inputs
-    if mode in ("resize", "buffered-burst", "slow-frame", "zlib-cursor", "low-bandwidth", "remember", "responsive-input", "view-input"):
+    if mode in ("resize", "buffered-burst", "slow-frame", "zlib-cursor", "low-bandwidth", "remember", "responsive-input", "view-input", "apple", "apple-codec"):
         assert "RENDER pixels and letterbox after window resize" in result.stdout, result.stdout
-        initial = "5x3 #ef4931" if low else "4x3 #ef4a32"
+        initial = "4x3 #ef4931" if mode == "apple-codec" else "5x3 #ef4931" if low else "4x3 #ef4a32"
         assert f"FRAME {initial}" in result.stdout, result.stdout
         size = "64x6" if mode == "slow-frame" else "9x6" if low else "8x6"
-        color = "#1034ad" if low else "#1234ab"
+        color = "#1030ad" if mode == "apple-codec" else "#1034ad" if low else "#1234ab"
         assert f"FRAME {size} {color}" in result.stdout, result.stdout
         if mode == "view-input":
             # Events go through RemoteView (window delivery), not Session directly:
@@ -267,9 +393,14 @@ def run_case(mode):
         else:
             assert ("pointer", 2, 1, 1) in inputs and ("pointer", 2, 1, 0) in inputs, inputs
         assert ("key", ord("a"), 1) in inputs and ("key", ord("a"), 0) in inputs, inputs
+        if mode in ("apple", "apple-codec"):
+            # The session arms Apple's pushed updates and re-arms after the
+            # layout, while asking for at most an opening and a repaint frame.
+            assert apple_stats["arms"] >= 2 and apple_stats["pushed"] >= 2, apple_stats
+            assert apple_stats["requests"] <= 2, apple_stats
     print(f"PASS {mode}: protocol negotiation, framebuffer and event loop")
 
 with tempfile.TemporaryDirectory(prefix="relay-unit-") as config:
     subprocess.run([str(ROOT / "build/relay"), "--self-test"], env=os.environ | {"QT_QPA_PLATFORM":"offscreen", "QT_QPA_PLATFORMTHEME":"", "QT_STYLE_OVERRIDE":"", "XDG_CONFIG_HOME":config}, check=True)
-for mode in (sys.argv[1:] or ("resize", "buffered-burst", "slow-frame", "responsive-input", "view-input", "zlib-cursor", "low-bandwidth", "cancel", "disconnect", "oversized", "auth-rejected")):
+for mode in (sys.argv[1:] or ("resize", "buffered-burst", "slow-frame", "responsive-input", "view-input", "apple", "apple-codec", "zlib-cursor", "low-bandwidth", "cancel", "disconnect", "oversized", "auth-rejected")):
     run_case(mode)

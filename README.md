@@ -59,8 +59,10 @@ Puoi anche avviare direttamente `./build/relay -platform wayland`.
 Nessun indirizzo o account personale è incluso nei sorgenti. Le immagini di
 questo README usano un profilo dimostrativo.
 Il trasporto VNC non aggiunge una VPN: per l’accesso via Internet usa Tailscale.
-La latenza della rete e un eventuale relay Tailscale influenzano la reattività;
-il profilo Fluido riduce i dati senza cambiare la risoluzione del Mac.
+La latenza della rete e un eventuale relay Tailscale influenzano la reattività.
+Sul Mac, Relay chiede prima i rettangoli compressi e lascia il raw per ultimo.
+Qualità usa il codec adattivo di Screen Sharing; Fluido usa ZRLE e colori
+a 16 bit. La risoluzione del Mac non cambia.
 
 ## Password e preferenze
 
