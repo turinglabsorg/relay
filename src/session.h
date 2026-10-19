@@ -54,13 +54,16 @@ private:
     int m_socket = -1;
     void trackSocket(int socket);
     bool drainInputs(rfbClient *client);
+    bool sendNow(const InputEvent &event);
     void noteDirty(QRect rect);
     bool presentFrame();
     std::deque<InputEvent> m_queue;
+    QMutex m_sendMutex;
+    std::atomic<rfbClient *> m_client{nullptr};
     std::atomic<bool> m_stop{false};
     bool m_notificationPending = false;
     bool m_dirty = false;
-    bool m_sendFailed = false;
+    std::atomic<bool> m_sendFailed{false};
     QRect m_frameDirty;
     qint64 m_maxInputDelayMs = 0;
     int m_statsRects = 0;
@@ -173,7 +176,9 @@ protected:
     void focusOutEvent(QFocusEvent *event) override;
 private:
     bool sendPointer(QPointF position, Qt::MouseButtons buttons, int wheel = 0);
-    void releaseStaleModifiers(Qt::KeyboardModifiers modifiers, int exceptKey = 0);
+    quint32 mappedRemoteKey(int qtKey, const QString &text);
+    QSet<quint32> intendedModifiers(Qt::KeyboardModifiers modifiers, int selfKey = 0);
+    void releaseModifiersExcept(const QSet<quint32> &keep);
     Session *m_session = nullptr;
     QImage m_image;
     quint64 m_frameVersion = 0;

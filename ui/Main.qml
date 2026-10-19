@@ -190,7 +190,7 @@ ApplicationWindow {
                 ColumnLayout {
                     Layout.fillWidth: true; spacing: 3
                     Text { text: session.displayName; color: root.fg; font.pixelSize: 16; font.weight: Font.DemiBold; Layout.fillWidth: true; elide: Text.ElideRight }
-                    Text { text: session.state === "connected" ? "Connesso  ·  " + session.resolution : (session.state === "disconnecting" ? "Chiusura sessione…" : "Connessione in corso…"); color: root.muted; font.pixelSize: 11; Layout.fillWidth: true; elide: Text.ElideRight }
+                    Text { text: session.state === "connected" ? "Connesso  ·  " + session.resolution + "  ·  " + (session.lowBandwidth ? "Fluido" : "Qualità") : (session.state === "disconnecting" ? "Chiusura sessione…" : "Connessione in corso…"); color: root.muted; font.pixelSize: 11; Layout.fillWidth: true; elide: Text.ElideRight }
                 }
                 ActionButton { compact: true; dark: root.dark; iconName: "camera"; hint: "Salva schermata"; enabled: session.state === "connected"; onClicked: { remote.releaseInput(); session.saveScreenshot(); remote.forceActiveFocus() } }
                 ActionButton { compact: true; dark: root.dark; iconName: "expand"; hint: "Schermo intero · F11"; onClicked: { root.toggleFullscreen(); remote.forceActiveFocus() } }
